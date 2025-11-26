@@ -124,7 +124,59 @@ Standard VCF 4.2 format with:
 - INFO fields: TYPE (SNV/INS/DEL), HOMOLOGY flag, PSEUDO flag
 - FILTER annotations for quality issues
 
+---
 
+## Variant Calling Details
 
+### De Novo Discovery Approach
 
+OTOAlyzer scans **every position** in the OTOA true gene region and reports variants that meet these criteria:
 
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| Min Total Depth | 10 | Minimum reads at position |
+| Min Alt Reads | 3 | Minimum alternate allele reads |
+| Min Alt Fraction | 0.10 | Minimum allele fraction |
+| Min Base Quality | 20 | Minimum base quality score |
+| Min Mapping Quality | 20 | Minimum mapping quality |
+
+### Quality Filters Applied
+
+| Filter | Description |
+|--------|-------------|
+| `LowDepth` | Total depth < 20 |
+| `LowAltReads` | Alt reads < 5 |
+| `StrandBias` | Significant strand bias (p < 0.001) with minor strand < 10% |
+| `HomologyRegion` | Position in high-homology region (from SNP file) |
+| `PseudogeneContamination` | Alt base matches pseudogene reference |
+| `BorderlineAF` | Allele fraction between 0.20-0.25 |
+
+### Pseudogene Contamination Detection
+
+For each variant, OTOAlyzer checks if the alternate allele might come from mismapped pseudogene reads by:
+1. Finding the corresponding pseudogene position
+2. Checking if the alt base is the predominant base there
+3. Flagging variants where alt base matches pseudogene reference
+
+---
+
+## Dependencies
+
+### Python (≥3.6)
+```
+numpy
+scipy
+pandas
+pysam
+```
+
+### R (≥4.0)
+```r
+BiocManager::install("CNVPanelizer")
+```
+
+---
+
+## License
+
+GNU General Public License v3.0 
