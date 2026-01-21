@@ -1,0 +1,15 @@
+# OTOA regions BED file for OTOAlyzer/CNVPanelizer
+# Required regions: OTOA_full, OTOAP1_full, OTOA_unique
+# Additional control regions recommended for normalization
+#
+# Format: chr	start	end	name
+#
+# NOTE: These are PLACEHOLDER coordinates - update with actual OTOA genomic positions!
+# GRCh37/hg19 coordinates for OTOA and OTOAP1:
+# OTOA (true gene): chr16:21,675,289-21,772,050
+# OTOAP1 (pseudogene): chr16:22,557,019-22,588,186
+#
+chr16	21675289	21740425	OTOA_unique
+chr16	21675289	21772050	OTOA_full
+chr16	21740426	21772050	OTOA_overlap
+chr16	22557019	22588186	OTOAP1_full
