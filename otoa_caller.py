@@ -22,6 +22,7 @@ Pipeline:
 STEP 1: cnvkit (flat reference) → total_cn, true_gene_cn (OTOA_unique)
 STEP 2: SNP counting at differentiating sites → per-site CN validation
 STEP 3: Regional consensus analysis → SV detection
+         (region boundaries derived dynamically from SNP file's 'region' column)
 STEP 4: De novo variant calling → SNPs/indels across true gene
 STEP 5: Quality filtering and output generation
 
@@ -88,6 +89,7 @@ from caller.otoa_sv import (
     OtoaSvResult,
     get_sv_description,
     is_pathogenic_sv,
+    compute_region_boundaries,
 )
 
 # De novo variant calling
@@ -142,10 +144,12 @@ OtoaRawData = namedtuple(
         "cnv_method",             # 'cnvkit' or 'cnvpanelizer'
         "cnv_total_cn",           # Total CN from CNV caller
         "cnv_otoa_cn",            # OTOA CN from CNV caller
-        "snp_true_gene_counts",
-        "snp_pseudo_counts",
-        "cn_per_site",
-        "regional_consensus",
+        "snp_true_gene_counts",   # List of read counts supporting true gene allele at each site
+        "snp_pseudo_counts",      # List of read counts supporting pseudogene allele at each site
+        "cn_per_site",            # Filtered CN call at each site
+        "cn_per_site_raw",        # Raw CN values (fraction * total_cn) at each site
+        "regional_consensus",     # Regional consensus CN pattern
+        "diff_site_info",         # List of (position, true_base, pseudo_base) for each SNP site
     ]
 )
 
@@ -216,6 +220,40 @@ def parse_bed_regions(bed_file: str) -> Dict[str, Dict]:
     return regions
 
 
+def parse_snp_site_info(snp_file: str) -> List[Tuple[int, str, str]]:
+    """
+    Parse SNP file to extract position and allele information for each differentiating site.
+    
+    Expected format (OTOA_SNP_38.txt, 7-column):
+    #chr  pos_OTOA  base_OTOA  pos_pseudo  base_pseudo  annotation  region
+    chr16 21729405  T          22545532    C            upstreamparalog  upstream
+    
+    Also supports legacy 6-column format (without region column).
+    
+    Args:
+        snp_file: Path to SNP definition file (e.g., OTOA_SNP_38.txt)
+        
+    Returns:
+        List of (position, true_gene_base, pseudogene_base) tuples in order
+    """
+    site_info = []
+    
+    with open(snp_file, 'r') as f:
+        for line in f:
+            if line.startswith('#') or line.strip() == '':
+                continue
+            
+            fields = line.strip().split('\t')
+            if len(fields) >= 5:
+                position = int(fields[1])      # pos_OTOA
+                true_base = fields[2].upper()  # base_OTOA (true gene)
+                pseudo_base = fields[4].upper()  # base_pseudo (pseudogene)
+                
+                site_info.append((position, true_base, pseudo_base))
+    
+    return site_info
+
+
 def find_true_gene_region(region_dic: Dict) -> Optional[Dict]:
     """
     Find the true gene region from the BED file regions.
@@ -265,6 +303,72 @@ def find_pseudogene_region(region_dic: Dict) -> Optional[Dict]:
     return None
 
 
+def calculate_raw_cn_values(
+    snp_true_counts: List[int],
+    snp_pseudo_counts: List[int],
+    total_cn: int,
+) -> List[Optional[float]]:
+    """
+    Calculate raw CN values at each SNP site based on allele fractions.
+    
+    Similar to CyriPanel's d67_snp_raw calculation:
+    raw_cn = total_cn * (true_gene_count / (true_gene_count + pseudo_count))
+    
+    Args:
+        snp_true_counts: Read counts supporting true gene allele at each site
+        snp_pseudo_counts: Read counts supporting pseudogene allele at each site
+        total_cn: Total copy number (true + pseudo)
+        
+    Returns:
+        List of raw CN values (float) at each site, None if insufficient reads
+    """
+    raw_cn_values = []
+    
+    for true_count, pseudo_count in zip(snp_true_counts, snp_pseudo_counts):
+        total_reads = true_count + pseudo_count
+        
+        if total_reads == 0:
+            raw_cn_values.append(None)
+        else:
+            # Calculate raw CN: total_cn * fraction of true gene reads
+            fraction = float(true_count) / float(total_reads)
+            raw_cn = total_cn * fraction
+            raw_cn_values.append(round(raw_cn, 3))
+    
+    return raw_cn_values
+
+
+def format_diff_site_raw_count(
+    diff_site_info: List[Tuple[int, str, str]],
+    snp_true_counts: List[int],
+    snp_pseudo_counts: List[int],
+) -> Dict[str, str]:
+    """
+    Format differential site read counts as a dictionary for JSON output.
+    
+    Creates CyriPanel-style format:
+    {"g.{position}{true_base}>{pseudo_base}": "{true_count},{pseudo_count}"}
+    
+    Args:
+        diff_site_info: List of (position, true_base, pseudo_base) tuples
+        snp_true_counts: Read counts supporting true gene allele
+        snp_pseudo_counts: Read counts supporting pseudogene allele
+        
+    Returns:
+        Dictionary with formatted differential site raw counts
+    """
+    diff_site_raw_count = OrderedDict()
+    
+    for i, (position, true_base, pseudo_base) in enumerate(diff_site_info):
+        if i < len(snp_true_counts) and i < len(snp_pseudo_counts):
+            # Format: "g.{position}{true_base}>{pseudo_base}": "{true_count},{pseudo_count}"
+            site_key = f"g.{position}{true_base}>{pseudo_base}"
+            site_value = f"{snp_true_counts[i]},{snp_pseudo_counts[i]}"
+            diff_site_raw_count[site_key] = site_value
+    
+    return diff_site_raw_count
+
+
 # =============================================================================
 # Resource Loading
 # =============================================================================
@@ -305,6 +409,10 @@ def prepare_resources(datadir: str, genome: str, bed_file_path: str) -> Dict:
     snp_db = get_snp_position(snp_file, genome)
     logging.info(f"Loaded {len(snp_db.dsnp1)} differentiating SNP sites")
     
+    # Parse SNP site info for output formatting (position, true_base, pseudo_base)
+    diff_site_info = parse_snp_site_info(snp_file)
+    logging.info(f"Parsed {len(diff_site_info)} differential site info entries")
+    
     # Load homology sites for variant filtering
     homology_sites = load_homology_sites(snp_file)
     logging.info(f"Loaded {len(homology_sites)} homology sites for variant filtering")
@@ -323,14 +431,27 @@ def prepare_resources(datadir: str, genome: str, bed_file_path: str) -> Dict:
         logging.info(f"Pseudogene region: {pseudogene_region['name']} "
                      f"({pseudogene_region['chrom']}:{pseudogene_region['start']}-{pseudogene_region['end']})")
     
+    # Compute region boundaries from SNP file's region column
+    region_boundaries = None
+    if snp_db.dregion:
+        num_sites = len(snp_db.dsnp1)
+        region_boundaries = compute_region_boundaries(snp_db.dregion, num_sites)
+        logging.info(f"Region boundaries (from SNP file):")
+        for rname, (rstart, rend) in region_boundaries.items():
+            logging.info(f"  {rname}: indices {rstart}-{rend-1} ({rend - rstart} SNPs)")
+    else:
+        logging.warning("No region column found in SNP file; SV detection will use fallback boundaries")
+
     return {
         "genome": genome,
         "region_dic": region_dic,
         "snp_db": snp_db,
+        "diff_site_info": diff_site_info,
         "homology_sites": homology_sites,
         "bed_file": bed_file_path,
         "true_gene_region": true_gene_region,
         "pseudogene_region": pseudogene_region,
+        "region_boundaries": region_boundaries,
     }
 
 
@@ -463,6 +584,7 @@ def call_sample(
     logging.info("STEP 2: Counting reads at differentiating SNP sites...")
     
     snp_db = resources["snp_db"]
+    diff_site_info = resources["diff_site_info"]
     
     # Get supporting reads for true gene (dsnp1) and pseudogene (dsnp2)
     snp_true_counts, snp_pseudo_counts = get_supporting_reads(
@@ -497,6 +619,13 @@ def call_sample(
         keep_none=True,
     )
     
+    # Calculate raw CN values (like CyriPanel's d67_snp_raw)
+    raw_cn_values = calculate_raw_cn_values(
+        snp_true_counts=snp_true_counts,
+        snp_pseudo_counts=snp_pseudo_counts,
+        total_cn=total_cn,
+    )
+    
     # Count valid CN calls
     valid_cn_calls = [c for c in cn_call_per_site if c is not None]
     logging.info(f"Valid CN calls: {len(valid_cn_calls)}/{len(cn_call_per_site)} sites "
@@ -512,6 +641,7 @@ def call_sample(
         cn_call_per_site=cn_call_per_site,
         true_gene_cn=true_gene_cn,
         pseudogene_cn=pseudogene_cn,
+        region_boundaries=resources.get("region_boundaries"),
     )
     
     logging.info(f"SV call: {sv_result.sv_type} (confidence: {sv_result.confidence:.2f})")
@@ -592,7 +722,7 @@ def call_sample(
     
     logging.info(f"Filter status: {filter_status}")
     
-    # Compile raw data for debugging/output
+    # Compile raw data for debugging/output (now includes diff_site_info)
     raw_data = OtoaRawData(
         cnv_method=cnv_method,
         cnv_total_cn=total_cn,
@@ -600,7 +730,9 @@ def call_sample(
         snp_true_gene_counts=snp_true_counts,
         snp_pseudo_counts=snp_pseudo_counts,
         cn_per_site=cn_call_per_site,
+        cn_per_site_raw=raw_cn_values,
         regional_consensus=sv_result.cn_pattern,
+        diff_site_info=diff_site_info,
     )
     
     bamfile.close()
@@ -758,6 +890,14 @@ def write_json_output(results: List[OtoaCall], output_path: str):
                     "Haplotype": var.haplotype,
                     "Phase_Set": var.phase_set,
                 })
+            
+            # Add Variant_raw_count (like CyriPanel format: "ref_reads,alt_reads")
+            variant_raw_count = {}
+            for var in call.variants:
+                # Format variant ID in g. notation style
+                variant_key = f"g.{var.position}{var.ref_base}>{var.alt_base}"
+                variant_raw_count[variant_key] = f"{var.ref_reads},{var.alt_reads}"
+            sample_data["Variant_raw_count"] = variant_raw_count
 
         # Add phasing summary
         if call.phasing_summary:
@@ -778,12 +918,51 @@ def write_json_output(results: List[OtoaCall], output_path: str):
                 for pair in call.compound_het
             ]
         
-        # Add raw data if available
+        # Add raw data if available (now includes snp_call, snp_raw, and Diff_site_raw_count)
         if call.raw_data:
+            # Format snp_call as comma-separated string (like CyriPanel's d67_snp_call)
+            snp_call_str = ",".join(
+                str(c) if c is not None else "NA"
+                for c in call.raw_data.cn_per_site
+            )
+            
+            # Format snp_raw as comma-separated string (like CyriPanel's d67_snp_raw)
+            snp_raw_str = ",".join(
+                str(c) if c is not None else "NA"
+                for c in call.raw_data.cn_per_site_raw
+            )
+            
+            # Format CNV_consensus from regional consensus (like CyriPanel format)
+            cnv_consensus_str = None
+            if call.raw_data.regional_consensus:
+                consensus_values = [
+                    call.raw_data.regional_consensus.get("upstream"),
+                    call.raw_data.regional_consensus.get("5prime"),
+                    call.raw_data.regional_consensus.get("middle"),
+                    call.raw_data.regional_consensus.get("3prime"),
+                ]
+                cnv_consensus_str = ",".join(
+                    str(c) if c is not None else "NA"
+                    for c in consensus_values
+                )
+            
+            # Format Diff_site_raw_count: "g.{pos}{true_base}>{pseudo_base}": "true_count,pseudo_count"
+            diff_site_raw_count = None
+            if call.raw_data.diff_site_info:
+                diff_site_raw_count = format_diff_site_raw_count(
+                    diff_site_info=call.raw_data.diff_site_info,
+                    snp_true_counts=call.raw_data.snp_true_gene_counts,
+                    snp_pseudo_counts=call.raw_data.snp_pseudo_counts,
+                )
+            
             sample_data["Raw_Data"] = {
                 "CNV_Method": call.raw_data.cnv_method,
                 "CNV_Total_CN": call.raw_data.cnv_total_cn,
                 "CNV_OTOA_CN": call.raw_data.cnv_otoa_cn,
+                "CNV_consensus": cnv_consensus_str,
+                "snp_call": snp_call_str,
+                "snp_raw": snp_raw_str,
+                "Diff_site_raw_count": diff_site_raw_count,
                 "Regional_Consensus": call.raw_data.regional_consensus,
             }
         
@@ -904,8 +1083,8 @@ Examples:
     parser.add_argument(
         "--genome",
         required=True,
-        choices=["38","37"],
-        help="Reference genome version (currently only GRCh37 and GRCh38 supported)",
+        choices=["38"],
+        help="Reference genome version (only GRCh38/hg38 supported)",
     )
     parser.add_argument(
         "--prefix",
@@ -944,7 +1123,7 @@ Examples:
     parser.add_argument(
         "--dataDir",
         default=None,
-        help="Path to data directory containing OTOA_SNP_genome.txt (default: ./data)",
+        help="Path to data directory containing OTOA_SNP_38.txt (default: ./data)",
     )
     parser.add_argument(
         "--reference",
