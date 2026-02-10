@@ -19,38 +19,37 @@ adapted from Cyrius's approach for CYP2D6.
 OTOA Gene Structure (based on OTOA_SNP_38.txt annotations):
 The homologous region between OTOA and OTOAP1 spans exon21-exon29.
 
-SNP Distribution in OTOA_SNP_38.txt (157 SNPs total):
-- upstreamparalog: 12 SNPs (indices 0-11)
-- upstreamparalog_150bp: 2 SNPs (indices 12-13)
-- exon21: 1 SNP (index 14)
-- intron21: 63 SNPs (indices 15-77)
-- exon22: 3 SNPs (indices 78-80)
-- intron22: 17 SNPs (indices 81-97)
-- intron23: 4 SNPs (indices 98-101)
-- intron24: 10 SNPs (indices 102-111)
-- intron26: 1 SNP (index 112)
-- intron27: 12 SNPs (indices 113-124)
-- intron28: 27 SNPs (indices 125-151)
-- exon29: 3 SNPs (indices 152-154)
-- down_exon29: 2 SNPs (indices 155-156)
-Total: 157 SNPs
+SNP Distribution in OTOA_SNP_38.txt (85 SNPs total):
+- upstreamparalog: 8 SNPs
+- upstreamparalog_150bp: 2 SNPs
+- intron21: 46 SNPs (spans 5prime and middle regions)
+- exon22: 2 SNPs
+- intron22: 5 SNPs
+- intron23: 1 SNP
+- intron24: 1 SNP
+- intron27: 5 SNPs
+- intron28: 13 SNPs
+- exon29: 1 SNP
+- down_exon29: 1 SNP
+Total: 85 SNPs
 
-Regional Division (4 regions, like CYP2D6):
-1. upstream_region:  upstreamparalog + upstreamparalog_150bp (14 SNPs, indices 0-13)
-2. 5prime_region:    exon21 + intron21 (64 SNPs, indices 14-77)
-3. middle_region:    exon22 + intron22 + intron23 + intron24 (34 SNPs, indices 78-111)
-4. 3prime_region:    intron26 + intron27 + intron28 + exon29 + down_exon29 (45 SNPs, indices 112-156)
+Regional Division (4 regions, defined by 'region' column in SNP file):
+1. upstream:  upstreamparalog + upstreamparalog_150bp (10 SNPs, indices 0-9)
+2. 5prime:    intron21 (5' portion) (33 SNPs, indices 10-42)
+3. middle:    intron21 (3' portion) + exon22 + intron22 + intron23 (21 SNPs, indices 43-63)
+4. 3prime:    intron24 + intron27 + intron28 + exon29 + down_exon29 (21 SNPs, indices 64-84)
 
 SV Types Detected:
 - Deletions (heterozygous/homozygous) of true gene
 - Deletions of pseudogene
 - Duplications of true gene
+- Duplications of pseudogene
 - Gene conversions (partial CN changes)
 - Hybrid genes
 """
 
 import logging
-from collections import namedtuple, Counter
+from collections import namedtuple, Counter, OrderedDict
 from typing import List, Optional, Tuple, Dict
 
 # =============================================================================
@@ -71,39 +70,86 @@ OtoaSvResult = namedtuple(
 OtoaRegionalCN = namedtuple(
     "OtoaRegionalCN",
     [
-        "upstream",      # upstream paralog region (indices 0-13, 14 SNPs)
-        "region_5prime", # exon21 + intron21 (indices 14-77, 64 SNPs)
-        "region_middle", # exon22 through intron24 (indices 78-111, 34 SNPs)
-        "region_3prime", # intron26 through exon29 (indices 112-156, 45 SNPs)
+        "upstream",      # upstream paralog region
+        "region_5prime", # 5' portion of homologous region
+        "region_middle", # middle portion of homologous region
+        "region_3prime", # 3' portion of homologous region
     ]
 )
 
 # =============================================================================
-# Constants for OTOA Regional Analysis
-# Based on OTOA_SNP_38.txt annotation column
+# Region Boundary Computation
 # =============================================================================
 
-# Region boundaries (SNP indices)
-UPSTREAM_START = 0
-UPSTREAM_END = 14           # indices 0-13: upstreamparalog + upstreamparalog_150bp (14 SNPs)
-
-REGION_5PRIME_START = 14
-REGION_5PRIME_END = 78      # indices 14-77: exon21 + intron21 (64 SNPs)
-
-REGION_MIDDLE_START = 78
-REGION_MIDDLE_END = 112     # indices 78-111: exon22 + intron22 + intron23 + intron24 (34 SNPs)
-
-REGION_3PRIME_START = 112
-REGION_3PRIME_END = 157     # indices 112-156: intron26 + intron27 + intron28 + exon29 + down_exon29 (45 SNPs)
-
-# Minimum sites for reliable consensus (approximately 50% of region size)
-UPSTREAM_SITES_MIN = 7          # ~50% of 14 SNPs
-REGION_5PRIME_SITES_MIN = 32    # ~50% of 64 SNPs
-REGION_MIDDLE_SITES_MIN = 17    # ~50% of 34 SNPs
-REGION_3PRIME_SITES_MIN = 22    # ~50% of 45 SNPs
+# Expected region labels in order (must match 'region' column in SNP file)
+EXPECTED_REGION_ORDER = ["upstream", "5prime", "middle", "3prime"]
 
 # Looser threshold when primary consensus fails
-CONSENSUS_MIN_LOOSE = 10
+CONSENSUS_MIN_LOOSE = 5
+
+# Minimum fraction of region sites for reliable consensus
+CONSENSUS_MIN_FRACTION = 0.5
+
+
+def compute_region_boundaries(dregion: Dict[int, str], num_sites: int) -> Dict[str, Tuple[int, int]]:
+    """
+    Compute region boundaries (start, end indices) from the region assignments
+    parsed from the SNP file's 'region' column.
+
+    This replaces hardcoded constants, making the code robust to changes in
+    the number of differentiating sites or region borders.
+
+    Args:
+        dregion: Dict mapping SNP index to region label
+                 (e.g., {0: "upstream", 1: "upstream", ..., 10: "5prime", ...})
+        num_sites: Total number of SNP sites
+
+    Returns:
+        OrderedDict mapping region name to (start_index, end_index) tuple
+        where end_index is exclusive (Python slice convention).
+        e.g., {"upstream": (0, 10), "5prime": (10, 43), "middle": (43, 64), "3prime": (64, 85)}
+    """
+    if not dregion:
+        logging.warning("No region information available; using equal-split fallback")
+        quarter = num_sites // 4
+        return OrderedDict([
+            ("upstream", (0, quarter)),
+            ("5prime", (quarter, 2 * quarter)),
+            ("middle", (2 * quarter, 3 * quarter)),
+            ("3prime", (3 * quarter, num_sites)),
+        ])
+
+    # Collect all indices per region label
+    region_indices = {}
+    for idx in sorted(dregion.keys()):
+        label = dregion[idx]
+        region_indices.setdefault(label, [])
+        region_indices[label].append(idx)
+
+    # Build boundaries: (min_index, max_index + 1) for each region in order
+    boundaries = OrderedDict()
+    for region_name in EXPECTED_REGION_ORDER:
+        if region_name in region_indices:
+            indices = region_indices[region_name]
+            boundaries[region_name] = (min(indices), max(indices) + 1)
+        else:
+            logging.warning(f"Region '{region_name}' not found in SNP file")
+
+    return boundaries
+
+
+def get_min_sites_for_region(region_size: int, fraction: float = CONSENSUS_MIN_FRACTION) -> int:
+    """
+    Calculate minimum number of sites required for consensus in a region.
+
+    Args:
+        region_size: Number of SNP sites in the region
+        fraction: Minimum fraction of sites required (default 0.5)
+
+    Returns:
+        Minimum site count (at least 1)
+    """
+    return max(1, int(region_size * fraction))
 
 
 # =============================================================================
@@ -115,6 +161,7 @@ def get_otoa_sv_call(
     cn_call_per_site: List[Optional[int]],
     true_gene_cn: int,
     pseudogene_cn: int,
+    region_boundaries: Optional[Dict[str, Tuple[int, int]]] = None,
 ) -> OtoaSvResult:
     """
     Determine SV type based on regional CN patterns.
@@ -125,8 +172,10 @@ def get_otoa_sv_call(
     Args:
         total_cn: Total copy number (true gene + pseudogene)
         cn_call_per_site: Per-site CN calls from Poisson model
-        true_gene_cn: CN of true OTOA gene (from CNVPanelizer OTOA_unique)
+        true_gene_cn: CN of true OTOA gene (from OTOA_unique)
         pseudogene_cn: CN of pseudogene (total_cn - true_gene_cn)
+        region_boundaries: Dict mapping region names to (start, end) index tuples.
+                           Computed dynamically from SNP file if provided.
         
     Returns:
         OtoaSvResult with SV classification
@@ -144,7 +193,7 @@ def get_otoa_sv_call(
         )
     
     # Get regional consensus from per-site CN calls
-    consensus = get_regional_consensus(cn_call_per_site, total_cn)
+    consensus = get_regional_consensus(cn_call_per_site, total_cn, region_boundaries)
     
     logging.info(f"Regional consensus: upstream={consensus.upstream}, "
                  f"5prime={consensus.region_5prime}, middle={consensus.region_middle}, "
@@ -185,6 +234,7 @@ def get_otoa_sv_call(
 def get_regional_consensus(
     cn_call_per_site: List[Optional[int]],
     total_cn: int,
+    region_boundaries: Optional[Dict[str, Tuple[int, int]]] = None,
 ) -> OtoaRegionalCN:
     """
     Calculate consensus CN for each region of the OTOA gene.
@@ -197,6 +247,8 @@ def get_regional_consensus(
     Args:
         cn_call_per_site: Per-site CN calls from Poisson model
         total_cn: Total CN for reference
+        region_boundaries: Dict mapping region names to (start, end) index tuples.
+                           If None, falls back to equal-split partitioning.
         
     Returns:
         OtoaRegionalCN named tuple with consensus CN for each region
@@ -205,44 +257,64 @@ def get_regional_consensus(
     if not cn_call_per_site:
         return OtoaRegionalCN(None, None, None, None)
     
-    # Extract sites for each region based on OTOA_SNP_38.txt structure
-    upstream_sites = [
-        a for a in cn_call_per_site[UPSTREAM_START:UPSTREAM_END]
-        if a is not None
-    ]
-    
-    region_5prime_sites = [
-        a for a in cn_call_per_site[REGION_5PRIME_START:REGION_5PRIME_END]
-        if a is not None
-    ]
-    
-    region_middle_sites = [
-        a for a in cn_call_per_site[REGION_MIDDLE_START:REGION_MIDDLE_END]
-        if a is not None
-    ]
-    
-    region_3prime_sites = [
-        a for a in cn_call_per_site[REGION_3PRIME_START:REGION_3PRIME_END]
-        if a is not None
-    ]
-    
+    num_sites = len(cn_call_per_site)
+
+    # Use provided boundaries or compute fallback
+    if region_boundaries is None:
+        logging.warning("No region boundaries provided; using equal-split fallback")
+        quarter = num_sites // 4
+        region_boundaries = OrderedDict([
+            ("upstream", (0, quarter)),
+            ("5prime", (quarter, 2 * quarter)),
+            ("middle", (2 * quarter, 3 * quarter)),
+            ("3prime", (3 * quarter, num_sites)),
+        ])
+
+    def _extract_region_sites(start, end):
+        """Extract non-None CN values for a region."""
+        return [a for a in cn_call_per_site[start:end] if a is not None]
+
+    # Extract sites per region
+    region_sites = {}
+    for region_name, (start, end) in region_boundaries.items():
+        region_sites[region_name] = _extract_region_sites(start, end)
+        region_size = end - start
+        logging.debug(f"Region {region_name}: {len(region_sites[region_name])}/{region_size} valid sites "
+                      f"(indices {start}-{end-1})")
+
     # Calculate consensus for each region
     upstream_consensus = _get_region_consensus(
-        upstream_sites, UPSTREAM_SITES_MIN, total_cn
+        region_sites.get("upstream", []),
+        get_min_sites_for_region(
+            region_boundaries["upstream"][1] - region_boundaries["upstream"][0]
+        ) if "upstream" in region_boundaries else 1,
+        total_cn,
     )
-    
+
     consensus_5prime = _get_region_consensus(
-        region_5prime_sites, REGION_5PRIME_SITES_MIN, total_cn
+        region_sites.get("5prime", []),
+        get_min_sites_for_region(
+            region_boundaries["5prime"][1] - region_boundaries["5prime"][0]
+        ) if "5prime" in region_boundaries else 1,
+        total_cn,
     )
-    
+
     consensus_middle = _get_region_consensus(
-        region_middle_sites, REGION_MIDDLE_SITES_MIN, total_cn
+        region_sites.get("middle", []),
+        get_min_sites_for_region(
+            region_boundaries["middle"][1] - region_boundaries["middle"][0]
+        ) if "middle" in region_boundaries else 1,
+        total_cn,
     )
-    
+
     consensus_3prime = _get_region_consensus(
-        region_3prime_sites, REGION_3PRIME_SITES_MIN, total_cn
+        region_sites.get("3prime", []),
+        get_min_sites_for_region(
+            region_boundaries["3prime"][1] - region_boundaries["3prime"][0]
+        ) if "3prime" in region_boundaries else 1,
+        total_cn,
     )
-    
+
     # Fill in missing consensus values from adjacent regions (like Cyrius)
     # This helps when one region has insufficient data
     if consensus_5prime is None and consensus_middle is not None:
@@ -324,7 +396,7 @@ def classify_sv(
     
     Args:
         total_cn: Total CN
-        true_gene_cn: True gene CN (from CNVPanelizer OTOA_unique)
+        true_gene_cn: True gene CN (from OTOA_unique)
         pseudogene_cn: Pseudogene CN
         consensus: Regional consensus values
         
@@ -344,7 +416,7 @@ def classify_sv(
         if all_regions_normal:
             return ("normal", 0.95, [])
     
-    # --- Simple whole-gene events (based on CNVPanelizer results) ---
+    # --- Simple whole-gene events for TRUE GENE (OTOA) ---
     
     # Heterozygous deletion of true gene (CN=1)
     if true_gene_cn == 1 and pseudogene_cn == 2:
@@ -362,13 +434,60 @@ def classify_sv(
     if true_gene_cn >= 4 and pseudogene_cn == 2:
         return (f"true_gene_cn{true_gene_cn}", 0.80, ["whole_gene_multiplication"])
     
-    # Heterozygous deletion of pseudogene
+    # --- Simple whole-gene events for PSEUDOGENE (OTOAP1) ---
+    
+    # Heterozygous deletion of pseudogene (CN=1)
     if true_gene_cn == 2 and pseudogene_cn == 1:
         return ("pseudogene_del_het", 0.85, ["pseudogene_deletion"])
     
-    # Homozygous deletion of pseudogene
+    # Homozygous deletion of pseudogene (CN=0)
     if true_gene_cn == 2 and pseudogene_cn == 0:
         return ("pseudogene_del_hom", 0.90, ["pseudogene_deletion_hom"])
+    
+    # Duplication of pseudogene (CN=3)
+    if true_gene_cn == 2 and pseudogene_cn == 3:
+        return ("pseudogene_dup", 0.85, ["pseudogene_duplication"])
+    
+    # Triplication or higher of pseudogene (CN>=4)
+    if true_gene_cn == 2 and pseudogene_cn >= 4:
+        return (f"pseudogene_cn{pseudogene_cn}", 0.80, ["pseudogene_multiplication"])
+    
+    # --- Combined events: both true gene and pseudogene affected ---
+    
+    # True gene deletion + pseudogene duplication
+    if true_gene_cn == 1 and pseudogene_cn == 3:
+        return ("true_del_pseudo_dup", 0.75, ["true_gene_deletion", "pseudogene_duplication"])
+    
+    if true_gene_cn == 1 and pseudogene_cn >= 4:
+        return (f"true_del_pseudo_cn{pseudogene_cn}", 0.70, ["true_gene_deletion", "pseudogene_multiplication"])
+    
+    # True gene duplication + pseudogene deletion
+    if true_gene_cn == 3 and pseudogene_cn == 1:
+        return ("true_dup_pseudo_del", 0.75, ["true_gene_duplication", "pseudogene_deletion"])
+    
+    if true_gene_cn >= 4 and pseudogene_cn == 1:
+        return (f"true_cn{true_gene_cn}_pseudo_del", 0.70, ["true_gene_multiplication", "pseudogene_deletion"])
+    
+    # True gene duplication + pseudogene duplication (both increased)
+    if true_gene_cn == 3 and pseudogene_cn == 3:
+        return ("both_dup", 0.75, ["true_gene_duplication", "pseudogene_duplication"])
+    
+    if true_gene_cn >= 3 and pseudogene_cn >= 3:
+        return (f"true_cn{true_gene_cn}_pseudo_cn{pseudogene_cn}", 0.70, 
+                ["true_gene_multiplication", "pseudogene_multiplication"])
+    
+    # True gene deletion + pseudogene deletion (both decreased)
+    if true_gene_cn == 1 and pseudogene_cn == 1:
+        return ("both_del_het", 0.75, ["true_gene_deletion", "pseudogene_deletion"])
+    
+    if true_gene_cn == 0 and pseudogene_cn == 1:
+        return ("true_del_hom_pseudo_del_het", 0.80, ["true_gene_deletion_hom", "pseudogene_deletion"])
+    
+    if true_gene_cn == 1 and pseudogene_cn == 0:
+        return ("true_del_het_pseudo_del_hom", 0.80, ["true_gene_deletion", "pseudogene_deletion_hom"])
+    
+    if true_gene_cn == 0 and pseudogene_cn == 0:
+        return ("both_del_hom", 0.85, ["true_gene_deletion_hom", "pseudogene_deletion_hom"])
     
     # --- Regional CN changes (potential gene conversion or partial events) ---
     # Analyze CN transitions between adjacent regions
@@ -408,24 +527,29 @@ def classify_sv(
     
     # --- Handle unusual patterns ---
     
-    # Both true gene and pseudogene affected
+    # Both true gene and pseudogene affected (not caught above)
     if true_gene_cn != 2 and pseudogene_cn != 2:
         if true_gene_cn < 2 and pseudogene_cn < 2:
             return ("combined_deletion", 0.70, ["both_deleted"])
         elif true_gene_cn > 2 and pseudogene_cn > 2:
             return ("combined_duplication", 0.65, ["both_duplicated"])
         else:
+            # One increased, one decreased - complex rearrangement
             return ("hybrid", 0.60, ["complex_rearrangement"])
     
-    # Check for gene conversion when CNVPanelizer shows normal but regions vary
+    # Check for gene conversion when CNV caller shows normal but regions vary
     if true_gene_cn == 2 and pseudogene_cn == 2:
         if has_regional_variation(consensus):
             return ("gene_conversion", 0.70, ["regional_variation"])
     
-    # Cannot determine
+    # Cannot determine - provide informative SV type based on available data
+    if true_gene_cn != 2 or pseudogene_cn != 2:
+        return (f"unclassified_true{true_gene_cn}_pseudo{pseudogene_cn}", 0.50, 
+                ["unclassified_cn_change"])
+    
     logging.warning(f"Could not classify SV: true_cn={true_gene_cn}, pseudo_cn={pseudogene_cn}, "
                     f"consensus={consensus}")
-    return (None, 0.0, [])
+    return ("normal", 0.90, [])
 
 
 def has_regional_variation(consensus: OtoaRegionalCN) -> bool:
@@ -465,12 +589,12 @@ def detect_breakpoint(
     
     # Map change points to approximate genomic regions based on OTOA structure
     breakpoint_map = {
-        "del_upstream_to_5prime": "upstream_exon21_boundary",
-        "dup_upstream_to_5prime": "upstream_exon21_boundary",
-        "del_5prime_to_middle": "intron21_exon22_boundary",
-        "dup_5prime_to_middle": "intron21_exon22_boundary",
-        "del_middle_to_3prime": "intron24_intron26_boundary",
-        "dup_middle_to_3prime": "intron24_intron26_boundary",
+        "del_upstream_to_5prime": "upstream_intron21_5prime_boundary",
+        "dup_upstream_to_5prime": "upstream_intron21_5prime_boundary",
+        "del_5prime_to_middle": "intron21_middle_boundary",
+        "dup_5prime_to_middle": "intron21_middle_boundary",
+        "del_middle_to_3prime": "intron23_intron24_boundary",
+        "dup_middle_to_3prime": "intron23_intron24_boundary",
     }
     
     breakpoints = []
@@ -540,15 +664,38 @@ def summarize_sv_result(sv_result: OtoaSvResult) -> Dict:
 def get_sv_description(sv_type: str) -> str:
     """Get human-readable description of SV type."""
     descriptions = {
+        # Normal
         "normal": "Normal diploid (2 copies of OTOA, 2 copies of OTOAP1)",
         "cn2": "Normal diploid",
+        
+        # True gene (OTOA) events
         "true_gene_del_het": "Heterozygous deletion of OTOA (1 copy remaining)",
         "true_gene_del_hom": "Homozygous deletion of OTOA (0 copies)",
         "true_gene_dup": "Duplication of OTOA (3 copies)",
         "true_gene_cn3": "OTOA copy number = 3",
         "true_gene_cn4": "OTOA copy number = 4",
-        "pseudogene_del_het": "Heterozygous deletion of OTOAP1 pseudogene",
-        "pseudogene_del_hom": "Homozygous deletion of OTOAP1 pseudogene",
+        "true_gene_cn5": "OTOA copy number = 5",
+        "true_gene_cn6": "OTOA copy number = 6",
+        
+        # Pseudogene (OTOAP1) events
+        "pseudogene_del_het": "Heterozygous deletion of OTOAP1 pseudogene (1 copy remaining)",
+        "pseudogene_del_hom": "Homozygous deletion of OTOAP1 pseudogene (0 copies)",
+        "pseudogene_dup": "Duplication of OTOAP1 pseudogene (3 copies)",
+        "pseudogene_cn3": "OTOAP1 pseudogene copy number = 3",
+        "pseudogene_cn4": "OTOAP1 pseudogene copy number = 4",
+        "pseudogene_cn5": "OTOAP1 pseudogene copy number = 5",
+        "pseudogene_cn6": "OTOAP1 pseudogene copy number = 6",
+        
+        # Combined events
+        "true_del_pseudo_dup": "OTOA deletion + OTOAP1 duplication",
+        "true_dup_pseudo_del": "OTOA duplication + OTOAP1 deletion",
+        "both_dup": "Duplication of both OTOA and OTOAP1",
+        "both_del_het": "Heterozygous deletion of both OTOA and OTOAP1",
+        "both_del_hom": "Homozygous deletion of both OTOA and OTOAP1",
+        "true_del_hom_pseudo_del_het": "Homozygous OTOA deletion + heterozygous OTOAP1 deletion",
+        "true_del_het_pseudo_del_hom": "Heterozygous OTOA deletion + homozygous OTOAP1 deletion",
+        
+        # Partial/complex events
         "partial_deletion": "Partial deletion affecting part of OTOA",
         "partial_duplication": "Partial duplication affecting part of OTOA",
         "gene_conversion": "Gene conversion between OTOA and OTOAP1",
@@ -556,16 +703,95 @@ def get_sv_description(sv_type: str) -> str:
         "combined_duplication": "Duplication affecting both OTOA and OTOAP1",
         "hybrid": "Hybrid/fusion gene between OTOA and OTOAP1",
     }
-    return descriptions.get(sv_type, f"Unknown SV type: {sv_type}")
+    
+    # Check for exact match first
+    if sv_type in descriptions:
+        return descriptions[sv_type]
+    
+    # Handle dynamic CN types (e.g., "true_gene_cn7", "pseudogene_cn8")
+    if sv_type and sv_type.startswith("true_gene_cn"):
+        try:
+            cn = sv_type.replace("true_gene_cn", "")
+            return f"OTOA copy number = {cn}"
+        except:
+            pass
+    
+    if sv_type and sv_type.startswith("pseudogene_cn"):
+        try:
+            cn = sv_type.replace("pseudogene_cn", "")
+            return f"OTOAP1 pseudogene copy number = {cn}"
+        except:
+            pass
+    
+    # Handle combined dynamic types
+    if sv_type and "true" in sv_type and "pseudo" in sv_type:
+        return f"Complex CN change: {sv_type}"
+    
+    return f"Unknown SV type: {sv_type}"
 
 
 def is_pathogenic_sv(sv_type: str) -> bool:
-    """Determine if the SV is likely pathogenic for hearing loss."""
+    """
+    Determine if the SV is likely pathogenic for hearing loss.
+    
+    OTOA-related hearing loss (DFNB22) is autosomal recessive,
+    so pathogenic SVs are those that reduce functional OTOA copies.
+    
+    Note: Pseudogene duplications are generally NOT pathogenic
+    as they don't affect the functional gene.
+    """
     pathogenic_types = [
+        # True gene deletions (reduce functional copies)
         "true_gene_del_het",
         "true_gene_del_hom",
+        
+        # Combined deletions
         "combined_deletion",
+        "both_del_het",
+        "both_del_hom",
+        "true_del_hom_pseudo_del_het",
+        "true_del_het_pseudo_del_hom",
+        
+        # Gene conversion (may disrupt function)
         "gene_conversion",
+        
+        # Partial events affecting true gene
         "partial_deletion",
+        
+        # Hybrid genes (may be non-functional)
+        "hybrid",
     ]
-    return sv_type in pathogenic_types
+    
+    if sv_type in pathogenic_types:
+        return True
+    
+    # Also check for dynamic types with true gene deletion
+    if sv_type and "true_del" in sv_type:
+        return True
+    
+    return False
+
+
+def is_benign_sv(sv_type: str) -> bool:
+    """
+    Determine if the SV is likely benign.
+    
+    Pseudogene-only events are generally benign as they don't
+    affect the functional OTOA gene.
+    """
+    benign_types = [
+        "normal",
+        "cn2",
+        "pseudogene_del_het",
+        "pseudogene_del_hom",
+        "pseudogene_dup",
+    ]
+    
+    if sv_type in benign_types:
+        return True
+    
+    # Pseudogene CN changes are benign
+    if sv_type and sv_type.startswith("pseudogene_cn"):
+        return True
+    
+    return False
