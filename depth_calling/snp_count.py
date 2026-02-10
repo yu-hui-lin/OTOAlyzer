@@ -18,6 +18,10 @@ Used for:
 1. Validating CNVPanelizer CN estimates
 2. Per-site CN calling with Poisson model
 3. Regional consensus for SV detection
+
+SNP file format (OTOA_SNP_38.txt, 7-column):
+#chr  pos_OTOA  base_OTOA  pos_pseudo  base_pseudo  annotation  region
+chr16 21729405  T          22545532    C            upstreamparalog  upstream
 """
 
 from collections import namedtuple
@@ -44,21 +48,25 @@ def get_snp_position(pos_file, genome, group=None):
     """
     Get all base differences listed in the SNP location file.
     
-    Expected file format (tab-separated):
-    #chr  pos_OTOA  base_OTOA  pos_pseudo  base_pseudo  annotation
-    chr16 21729405  T          22545532    C            upstreamparalog
+    Expected file format (tab-separated, 7-column):
+    #chr  pos_OTOA  base_OTOA  pos_pseudo  base_pseudo  annotation  region
+    chr16 21729405  T          22545532    C            upstreamparalog  upstream
+    
+    Also supports legacy 6-column format (without region column).
     
     Args:
         pos_file: Path to SNP position file (e.g., OTOA_SNP_38.txt)
         genome: Reference genome version (e.g., '38')
-        group: Optional annotation group to filter by
+        group: Optional group to filter by (matched against annotation or region column)
         
     Returns:
-        Named tuple with dsnp1 (true gene), dsnp2 (pseudogene), nchr, dindex
+        Named tuple with dsnp1 (true gene), dsnp2 (pseudogene), nchr, dindex, dregion
+        - dregion: dict mapping SNP index to region label (e.g., {0: "upstream", 10: "5prime"})
     """
     dsnp1 = {}  # True gene (OTOA) alleles
     dsnp2 = {}  # Pseudogene (OTOAP1) alleles
     dindex = {}
+    dregion = {}  # Maps SNP counter index to region label
     nchr = None
 
     with open(pos_file) as read_pos:
@@ -71,31 +79,43 @@ def get_snp_position(pos_file, genome, group=None):
                 if nchr is None:
                     nchr = split_line[0]
 
-                if group is None or split_line[-1] == group:
-                    counter += 1
-                    reg1_name = split_line[1] + "_" + str(counter)  # OTOA position
-                    reg2_name = split_line[3] + "_" + str(counter)  # Pseudo position
-                    reg1_base = split_line[2].upper()  # OTOA base
-                    reg2_base = split_line[4].upper()  # Pseudo base
-                    
-                    # Handle strand orientation (if last column is '-')
-                    if split_line[-1] != "-":
-                        dsnp1.setdefault(reg1_name, "_".join([reg1_base, reg2_base]))
-                        dsnp2.setdefault(reg2_name, "_".join([reg1_base, reg2_base]))
-                    else:
-                        dsnp1.setdefault(
-                            reg1_name,
-                            "_".join([reg1_base, reverse_complement(reg2_base)]),
-                        )
-                        dsnp2.setdefault(
-                            reg2_name,
-                            "_".join([reverse_complement(reg1_base), reg2_base]),
-                        )
-                    dindex.setdefault(reg1_name, counter)
-                    dindex.setdefault(reg2_name, counter)
+                # Parse annotation (column 5) and region (column 6) if present
+                annotation = split_line[5] if len(split_line) > 5 else None
+                region = split_line[6] if len(split_line) > 6 else None
 
-    snp_lookup = namedtuple("snp_lookup", "dsnp1 dsnp2 nchr dindex")
-    dbsnp = snp_lookup(dsnp1, dsnp2, nchr, dindex)
+                # Filter by group: match against annotation or region column
+                if group is not None:
+                    if annotation != group and region != group:
+                        continue
+
+                counter += 1
+                reg1_name = split_line[1] + "_" + str(counter)  # OTOA position
+                reg2_name = split_line[3] + "_" + str(counter)  # Pseudo position
+                reg1_base = split_line[2].upper()  # OTOA base
+                reg2_base = split_line[4].upper()  # Pseudo base
+                
+                # Handle strand orientation (check annotation column for "-")
+                if annotation != "-":
+                    dsnp1.setdefault(reg1_name, "_".join([reg1_base, reg2_base]))
+                    dsnp2.setdefault(reg2_name, "_".join([reg1_base, reg2_base]))
+                else:
+                    dsnp1.setdefault(
+                        reg1_name,
+                        "_".join([reg1_base, reverse_complement(reg2_base)]),
+                    )
+                    dsnp2.setdefault(
+                        reg2_name,
+                        "_".join([reverse_complement(reg1_base), reg2_base]),
+                    )
+                dindex.setdefault(reg1_name, counter)
+                dindex.setdefault(reg2_name, counter)
+
+                # Store region assignment if available
+                if region:
+                    dregion[counter] = region
+
+    snp_lookup = namedtuple("snp_lookup", "dsnp1 dsnp2 nchr dindex dregion")
+    dbsnp = snp_lookup(dsnp1, dsnp2, nchr, dindex, dregion)
     return dbsnp
 
 
